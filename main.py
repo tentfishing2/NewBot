@@ -30,9 +30,6 @@ import re
 import httpx
 import psutil
 
-# Версии библиотек (по состоянию на март 2025, последние стабильные)
-# python-telegram-bot==21.0.1, loguru==0.7.2, python-dotenv==1.0.1, aiosqlite==0.20.0, httpx==0.27.0, tenacity==8.5.0, psutil==6.0.0
-
 # Загрузка переменных окружения
 load_dotenv()
 
@@ -67,9 +64,16 @@ MAX_PING_INTERVAL = 3600  # 1 час
 MAX_RESTART_ATTEMPTS = 3
 SYNC_INTERVAL = 600  # 10 минут
 CLEAN_VIOLATIONS_INTERVAL = 50 * 24 * 3600  # 50 дней
-CPU_THRESHOLD = 80.0
-RAM_THRESHOLD = 90.0
-REQUEST_TIMEOUT = 120  # Увеличенный тайм-аут для стабильности
+REQUEST_TIMEOUT = 120
+ENABLE_CPU_TRACKING = os.getenv("ENABLE_CPU_TRACKING", "False").lower() == "true"
+# Начальные пороги CPU и RAM теперь динамические
+CPU_THRESHOLD_DEFAULT = 80.0
+RAM_THRESHOLD_DEFAULT = 90.0
+CPU_THRESHOLD_MIN = 60.0
+RAM_THRESHOLD_MIN = 70.0
+CPU_THRESHOLD_MAX = 90.0
+RAM_THRESHOLD_MAX = 95.0
+RESOURCE_CHECK_INTERVAL = 300  # Проверка каждые 5 минут
 
 # Лимиты для rate limiting (в секундах)
 RATE_LIMITS = {
@@ -80,7 +84,6 @@ RATE_LIMITS = {
     "stats": 30,
     "restart": 60,
     "status": 30,
-    "set_threshold": 60
 }
 
 # Переменные окружения с проверкой типов
@@ -96,7 +99,7 @@ try:
     NIGHT_START = int(os.getenv("NIGHT_AUTO_REPLY_START", 22))
     NIGHT_END = int(os.getenv("NIGHT_AUTO_REPLY_END", 6))
     OWNER_ID = int(os.getenv("OWNER_ID"))
-    PING_URL = os.getenv("PING_URL", "https://uptime.betterstack.com/api/v2/heartbeat/X7K9P2M5Q8N3B6J1")
+    PING_URL = os.getenv("PING_URL", "https://uptime.betterstack.com/api/v1/heartbeat/KamjLgY2dh8ems1aezkNSKmu")
 except (ValueError, TypeError) as e:
     logger.critical(f"Ошибка в переменных окружения: {e}")
     sys.exit(1)
@@ -105,7 +108,7 @@ if not all([BOT_TOKEN, SECRET_CODE, CHANNEL_URL]):
     logger.critical("Отсутствуют обязательные переменные окружения!")
     sys.exit(1)
 
-# Сообщения (оставлены без изменений)
+# Сообщения
 WELCOME_TEXT = (
     "🌄✨ **Привет, {name}!** 🌟\n"
     "🏕️🌲 Добро пожаловать в **«Палатки-ДВ»** — место, где начинаются твои лучшие приключения!\n\n"
@@ -148,12 +151,17 @@ HELP_TEXT = (
     "• /help — список команд;\n"
     "• /stats — статистика (для админов);\n"
     "• /status — состояние бота (для админов);\n"
-    "• /restart — перезапуск бота (для админов);\n"
-    "• /set_threshold — установка порогов CPU/RAM (для админов)."
+    "• /restart — перезапуск бота (для админов)."
 )
 
+# Улучшенная регулярка для мата с учётом вариаций
 BAD_WORDS_PATTERN = re.compile(
-    r"\b(блять|сука|пиздец|хуй|ебать|пидор|мудак|долбоёб|хуёво|пизда|жопа|нахуй|говно|шлюха|хуесос|дебил|идиот|козёл|лох|мразь|тварь)\b",
+    r"(?<!\w)"
+    r"(?:б[лb][яa][тtь]?|с[уy][кk][аaи]?|п[иi][з3][дd][еe][цcт]?|х[уy][йiй]|[еeё][бb][аa][тtь]?|"
+    r"п[иi][дd][оo][рp]|[мm][уy][дd][аa][кk]|[дd][оo][лl][бb][оoё][бb]|[хx][уy][ёеe][вv][оo]|[пp][иi][з3][дd][аa]|"
+    r"[жj][оo][пp][аa]|[нn][аa][хx][уy][йi]|[гg][оo][вv][нn][оo]|[ш][лl][юy][хx][аa]|[хx][уy][еe][сc][оo][сc]|"
+    r"[дd][еe][бb][иi][лl]|[иi][дd][иi][оo][тt]|[кk][оo][з3][ёеe][лl]|[лl][оo][хx]|[мm][рp][аa][з3][ьъ]?|[тt][вv][аa][рp][ьъ]?)"
+    r"(?![a-zA-Z0-9])",
     re.IGNORECASE | re.UNICODE
 )
 
@@ -221,7 +229,7 @@ def is_admin(user_id: int) -> bool:
 
 def is_night_time() -> bool:
     current_hour = get_current_time().hour
-    return NIGHT_START <= current_hour or current_hour < NIGHT_END  # Учтено пересечение полуночи
+    return NIGHT_START <= current_hour or current_hour < NIGHT_END
 
 def rate_limit(command_name: str = "default"):
     def decorator(func):
@@ -248,20 +256,55 @@ async def notify_admins(context: ContextTypes.DEFAULT_TYPE, message: str) -> Non
 def create_subscribe_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("👉 ПОДПИСАТЬСЯ НА КАНАЛ 👈", url=CHANNEL_URL)]])
 
-# Мониторинг ресурсов
-def check_resources() -> bool:
+# Мониторинг ресурсов с автоматическим контролем порогов
+def check_resources(context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
         cpu_usage = psutil.cpu_percent(interval=1)
         ram_usage = psutil.virtual_memory().percent
-        return cpu_usage < CPU_THRESHOLD and ram_usage < RAM_THRESHOLD
+        cpu_threshold = context.bot_data.get('cpu_threshold', CPU_THRESHOLD_DEFAULT)
+        ram_threshold = context.bot_data.get('ram_threshold', RAM_THRESHOLD_DEFAULT)
+        return cpu_usage < cpu_threshold and ram_usage < ram_threshold
     except Exception as e:
         logger.error(f"Ошибка проверки ресурсов: {e}")
-        return True  # Не прерываем работу при ошибке
+        return True
 
-# Отслеживание CPU
+async def adjust_resource_thresholds(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        cpu_usage = psutil.cpu_percent(interval=1)
+        ram_usage = psutil.virtual_memory().percent
+        current_cpu_threshold = context.bot_data.get('cpu_threshold', CPU_THRESHOLD_DEFAULT)
+        current_ram_threshold = context.bot_data.get('ram_threshold', RAM_THRESHOLD_DEFAULT)
+
+        # Адаптивная регулировка порогов
+        if cpu_usage > current_cpu_threshold * 0.9:
+            new_cpu_threshold = min(current_cpu_threshold + 5.0, CPU_THRESHOLD_MAX)
+        elif cpu_usage < current_cpu_threshold * 0.6:
+            new_cpu_threshold = max(current_cpu_threshold - 5.0, CPU_THRESHOLD_MIN)
+        else:
+            new_cpu_threshold = current_cpu_threshold
+
+        if ram_usage > current_ram_threshold * 0.9:
+            new_ram_threshold = min(current_ram_threshold + 5.0, RAM_THRESHOLD_MAX)
+        elif ram_usage < current_ram_threshold * 0.6:
+            new_ram_threshold = max(current_ram_threshold - 5.0, RAM_THRESHOLD_MIN)
+        else:
+            new_ram_threshold = current_ram_threshold
+
+        # Обновляем пороги, если они изменились
+        if new_cpu_threshold != current_cpu_threshold or new_ram_threshold != current_ram_threshold:
+            context.bot_data['cpu_threshold'] = new_cpu_threshold
+            context.bot_data['ram_threshold'] = new_ram_threshold
+            logger.info(f"Пороги ресурсов обновлены: CPU={new_cpu_threshold}%, RAM={new_ram_threshold}%")
+            await notify_admins(context, f"🔧 Пороги ресурсов обновлены: CPU={new_cpu_threshold}%, RAM={new_ram_threshold}%")
+    except Exception as e:
+        logger.error(f"Ошибка при регулировке порогов ресурсов: {e}")
+
+# Отслеживание CPU с возможностью отключения
 def track_cpu_time(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
+        if not ENABLE_CPU_TRACKING:
+            return await func(*args, **kwargs)
         start_time = time.process_time()
         result = await func(*args, **kwargs)
         cpu_time = time.process_time() - start_time
@@ -347,7 +390,7 @@ async def restart_self(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> N
 )
 @track_cpu_time
 async def ping_uptime(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.bot_data.get('ping_enabled', False) or not check_resources():
+    if not context.bot_data.get('ping_enabled', False) or not check_resources(context):
         logger.info("Пинг отключен или высокая нагрузка, пропускаю")
         return
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=15.0)) as client:
@@ -426,7 +469,7 @@ async def welcome_read_button(update: Update, context: ContextTypes.DEFAULT_TYPE
 )
 @track_cpu_time
 async def night_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message.chat_id != GROUP_ID or not update.message.text or not is_night_time() or not check_resources():
+    if update.message.chat_id != GROUP_ID or not update.message.text or not is_night_time() or not check_resources(context):
         return
     now = get_current_time()
     user_name = update.message.from_user.first_name
@@ -450,43 +493,55 @@ async def night_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat_id != GROUP_ID or not update.message.text or is_admin(update.effective_user.id):
         return
-    text = update.message.text
-    if len(text) < MIN_MESSAGE_LENGTH or not BAD_WORDS_PATTERN.search(text):
+    text = update.message.text.lower()
+    if len(text) < MIN_MESSAGE_LENGTH:
         return
-    user_id = update.effective_user.id
-    now = get_current_time()
-    violation_data = await get_violations(user_id, context)
-    count = 0 if not violation_data["last_violation"] or (now - violation_data["last_violation"]) > timedelta(hours=VIOLATION_TIMEOUT_HOURS) else violation_data["count"]
-    count += 1
-    await update_violations(user_id, count, now, context)
-    try:
-        bot_rights = await context.bot.get_chat_member(chat_id=GROUP_ID, user_id=context.bot.id)
-        if bot_rights.can_delete_messages:
-            await update.message.delete()
-        remaining_lives = MAX_VIOLATIONS - count
-        keyboard = create_subscribe_keyboard()
-        await task_queue.put(
-            lambda: context.bot.send_message(
-                chat_id=GROUP_ID,
-                text=f"⚠️ Нарушение правил! Осталось предупреждений: {remaining_lives}",
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
-        )
-        if count >= MAX_VIOLATIONS and bot_rights.can_restrict_members:
-            await context.bot.ban_chat_member(GROUP_ID, user_id)
+
+    matches = list(BAD_WORDS_PATTERN.finditer(text))
+    if not matches:
+        return
+
+    for match in matches:
+        word = match.group(0)
+        if len(word) < 3 or any(c.isdigit() for c in word) or word in ["бла", "суп", "пика"]:
+            continue
+
+        user_id = update.effective_user.id
+        now = get_current_time()
+        violation_data = await get_violations(user_id, context)
+        count = 0 if not violation_data["last_violation"] or (now - violation_data["last_violation"]) > timedelta(hours=VIOLATION_TIMEOUT_HOURS) else violation_data["count"]
+        count += 1
+        await update_violations(user_id, count, now, context)
+
+        try:
+            bot_rights = await context.bot.get_chat_member(chat_id=GROUP_ID, user_id=context.bot.id)
+            if bot_rights.can_delete_messages:
+                await update.message.delete()
+            remaining_lives = MAX_VIOLATIONS - count
+            keyboard = create_subscribe_keyboard()
             await task_queue.put(
                 lambda: context.bot.send_message(
                     chat_id=GROUP_ID,
-                    text="🚫 Пользователь заблокирован.",
+                    text=f"⚠️ Нарушение правил! Слово: '{word}'. Осталось предупреждений: {remaining_lives}",
+                    parse_mode="HTML",
                     reply_markup=keyboard
                 )
             )
-    except (NetworkError, TimedOut):
-        logger.warning("Сетевая ошибка при проверке сообщения")
-        await activate_ping(context)
-    except BadRequest as e:
-        logger.error(f"Неверный запрос при проверке сообщения: {e}")
+            if count >= MAX_VIOLATIONS and bot_rights.can_restrict_members:
+                await context.bot.ban_chat_member(GROUP_ID, user_id)
+                await task_queue.put(
+                    lambda: context.bot.send_message(
+                        chat_id=GROUP_ID,
+                        text="🚫 Пользователь заблокирован.",
+                        reply_markup=keyboard
+                    )
+                )
+            break
+        except (NetworkError, TimedOut):
+            logger.warning("Сетевая ошибка при проверке сообщения")
+            await activate_ping(context)
+        except BadRequest as e:
+            logger.error(f"Неверный запрос при проверке сообщения: {e}")
 
 @rate_limit("rules")
 @track_cpu_time
@@ -535,30 +590,18 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     messages_processed = context.bot_data.get('messages_processed', 0)
     restarts = context.bot_data.get('restart_attempts', 0)
     ping_status = "Активен" if context.bot_data.get('ping_enabled', False) else "Не активен"
+    cpu_threshold = context.bot_data.get('cpu_threshold', CPU_THRESHOLD_DEFAULT)
+    ram_threshold = context.bot_data.get('ram_threshold', RAM_THRESHOLD_DEFAULT)
     status_text = (
         f"📈 <b>Состояние бота:</b>\n"
         f"⏳ Время работы: {int(uptime // 3600)}ч {int((uptime % 3600) // 60)}м\n"
         f"📩 Обработано сообщений: {messages_processed}\n"
-        f"💻 CPU: {cpu_usage:.1f}%\n"
-        f"🧠 RAM: {ram_usage:.1f}%\n"
+        f"💻 CPU: {cpu_usage:.1f}% (порог: {cpu_threshold:.1f}%)\n"
+        f"🧠 RAM: {ram_usage:.1f}% (порог: {ram_threshold:.1f}%)\n"
         f"🔄 Перезапусков: {restarts}\n"
         f"📡 Пинг: {ping_status}"
     )
     await update.message.reply_text(status_text, parse_mode="HTML")
-
-@rate_limit("set_threshold")
-@track_cpu_time
-async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🚫 Команда только для админов!")
-        return
-    try:
-        cpu, ram = map(float, context.args)
-        global CPU_THRESHOLD, RAM_THRESHOLD
-        CPU_THRESHOLD, RAM_THRESHOLD = cpu, ram
-        await update.message.reply_text(f"Пороги изменены: CPU={cpu}%, RAM={ram}%")
-    except ValueError:
-        await update.message.reply_text("🚫 Укажите два числа: /set_threshold <cpu> <ram>")
 
 @rate_limit("start")
 @track_cpu_time
@@ -605,7 +648,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 )
 @track_cpu_time
 async def health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not check_resources():
+    if not check_resources(context):
         logger.warning("Высокая нагрузка, пропускаю проверку здоровья")
         return
     try:
@@ -644,6 +687,8 @@ async def run_bot(application: Application) -> None:
     application.bot_data['violations_cache'] = {}
     application.bot_data['ping_interval'] = PING_INTERVAL
     application.bot_data['ping_enabled'] = False
+    application.bot_data['cpu_threshold'] = CPU_THRESHOLD_DEFAULT
+    application.bot_data['ram_threshold'] = RAM_THRESHOLD_DEFAULT
     await load_violations_cache(application)
 
     # Обработчики
@@ -653,7 +698,6 @@ async def run_bot(application: Application) -> None:
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("set_threshold", set_threshold))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Chat(GROUP_ID), check_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Chat(GROUP_ID), night_auto_reply))
     application.add_handler(CallbackQueryHandler(welcome_read_button, pattern="^welcome_read$"))
@@ -666,16 +710,15 @@ async def run_bot(application: Application) -> None:
     application.job_queue.run_repeating(health_check, interval=21600, name="health_check")
     application.job_queue.run_repeating(sync_violations_cache, interval=SYNC_INTERVAL, name="sync_violations")
     application.job_queue.run_repeating(clean_violations_cache, interval=CLEAN_VIOLATIONS_INTERVAL, name="clean_violations")
+    application.job_queue.run_repeating(adjust_resource_thresholds, interval=RESOURCE_CHECK_INTERVAL, name="adjust_thresholds")
 
 async def post_init(application: Application) -> None:
     application.create_task(task_worker(application), name="task_worker")
 
 async def main() -> None:
-    # Настройка политики цикла событий для Windows
     if platform.system() == "Windows":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    # Создание приложения с увеличенными тайм-аутами
     request = HTTPXRequest(
         connect_timeout=REQUEST_TIMEOUT,
         read_timeout=REQUEST_TIMEOUT,
