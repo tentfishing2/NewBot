@@ -29,7 +29,6 @@ import subprocess
 import re
 import httpx
 import psutil
-from transformers import pipeline
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -94,9 +93,6 @@ except (ValueError, TypeError) as e:
 if not all([BOT_TOKEN, SECRET_CODE, CHANNEL_URL]):
     logger.critical("Отсутствуют обязательные переменные окружения!")
     sys.exit(1)
-
-# Инициализация NLP
-nlp = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
 
 # Сообщения
 WELCOME_TEXT = (
@@ -185,7 +181,7 @@ async def sync_violations_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
                         (user_id, data["count"], data["last_violation"].isoformat() if data["last_violation"] else None)
                     )
                 await conn.commit()
-        logger.debug("Кэш нарушений синхронизирован с базой данных")  # Перевод в debug
+        logger.debug("Кэш нарушений синхронизирован с базой данных")
     except Exception as e:
         logger.error(f"Ошибка синхронизации кэша: {e}")
 
@@ -287,7 +283,7 @@ async def adjust_resource_thresholds(context: ContextTypes.DEFAULT_TYPE) -> None
         if new_cpu_threshold != current_cpu_threshold or new_ram_threshold != current_ram_threshold:
             context.bot_data['cpu_threshold'] = new_cpu_threshold
             context.bot_data['ram_threshold'] = new_ram_threshold
-            logger.debug(f"Пороги ресурсов обновлены: CPU={new_cpu_threshold}%, RAM={new_ram_threshold}%")  # Перевод в debug
+            logger.debug(f"Пороги ресурсов обновлены: CPU={new_cpu_threshold}%, RAM={new_ram_threshold}%")
             await notify_admins(context, f"🔧 Пороги ресурсов обновлены: CPU={new_cpu_threshold}%, RAM={new_ram_threshold}%")
     except Exception as e:
         logger.error(f"Ошибка при регулировке порогов ресурсов: {e}")
@@ -498,44 +494,42 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if len(word) < 3 or any(c.isdigit() for c in word) or word in ["бла", "суп", "пика"]:
             continue
 
-        result = nlp(text[:512])
-        if result[0]['label'] == 'NEGATIVE' and result[0]['score'] > 0.9:
-            user_id = update.effective_user.id
-            now = get_current_time()
-            violation_data = await get_violations(user_id, context)
-            count = 0 if not violation_data["last_violation"] or (now - violation_data["last_violation"]) > timedelta(hours=VIOLATION_TIMEOUT_HOURS) else violation_data["count"]
-            count += 1
-            await update_violations(user_id, count, now, context)
+        user_id = update.effective_user.id
+        now = get_current_time()
+        violation_data = await get_violations(user_id, context)
+        count = 0 if not violation_data["last_violation"] or (now - violation_data["last_violation"]) > timedelta(hours=VIOLATION_TIMEOUT_HOURS) else violation_data["count"]
+        count += 1
+        await update_violations(user_id, count, now, context)
 
-            try:
-                bot_rights = await get_bot_rights(context)
-                if bot_rights.can_delete_messages:
-                    await update.message.delete()
-                remaining_lives = MAX_VIOLATIONS - count
-                keyboard = create_subscribe_keyboard()
+        try:
+            bot_rights = await get_bot_rights(context)
+            if bot_rights.can_delete_messages:
+                await update.message.delete()
+            remaining_lives = MAX_VIOLATIONS - count
+            keyboard = create_subscribe_keyboard()
+            await task_queue.put(
+                lambda: context.bot.send_message(
+                    chat_id=GROUP_ID,
+                    text=f"⚠️ Нарушение правил! Слово: '{word}'. Осталось предупреждений: {remaining_lives}",
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+            )
+            if count >= MAX_VIOLATIONS and bot_rights.can_restrict_members:
+                await context.bot.ban_chat_member(GROUP_ID, user_id)
                 await task_queue.put(
                     lambda: context.bot.send_message(
                         chat_id=GROUP_ID,
-                        text=f"⚠️ Нарушение правил! Слово: '{word}'. Осталось предупреждений: {remaining_lives}",
-                        parse_mode="HTML",
+                        text="🚫 Пользователь заблокирован.",
                         reply_markup=keyboard
                     )
                 )
-                if count >= MAX_VIOLATIONS and bot_rights.can_restrict_members:
-                    await context.bot.ban_chat_member(GROUP_ID, user_id)
-                    await task_queue.put(
-                        lambda: context.bot.send_message(
-                            chat_id=GROUP_ID,
-                            text="🚫 Пользователь заблокирован.",
-                            reply_markup=keyboard
-                        )
-                    )
-                break
-            except (NetworkError, TimedOut):
-                logger.warning("Сетевая ошибка при проверке сообщения")
-                await activate_ping(context)
-            except BadRequest as e:
-                logger.error(f"Неверный запрос при проверке сообщения: {e}")
+            break
+        except (NetworkError, TimedOut):
+            logger.warning("Сетевая ошибка при проверке сообщения")
+            await activate_ping(context)
+        except BadRequest as e:
+            logger.error(f"Неверный запрос при проверке сообщения: {e}")
 
 @rate_limit("rules")
 @track_cpu_time
