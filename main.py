@@ -136,7 +136,7 @@ HELP_TEXT = (
 CONTACTS_TEXT = (
     "🌟 <b>Контакты «Палатки-ДВ»:</b>\n\n"
     "💬 <b>Telegram:</b> <a href='https://t.me/palatki_lodki_khv'>@palatki_lodki_khv</a>\n\n"
-    "📱 <b>WhatsApp:</b> <a href='https://wa.me/+79249203356'>+79249203356</a>\n\n"
+    "📱 <b>WhatsApp:</b> <a href='https://wa.me/+79249203356'>Позвонить / Написать</a>\n\n"
     "🌐 <b>Канал:</b> <a href='{CHANNEL_URL}'>Палатки-ДВ</a>\n\n"
     "Обращайтесь за консультацией или заказом!"
 )
