@@ -45,13 +45,13 @@ DB_TIMEOUT = 10
 RESTART_DELAY = 60
 MAX_VIOLATIONS = 3
 MIN_MESSAGE_LENGTH = 10
-PING_INTERVAL = 60  # Фиксированный интервал для Better Stack
+PING_INTERVAL = int(os.getenv("PING_INTERVAL", 60))  # По умолчанию 1 минута для теста
 MIN_PING_INTERVAL = 60
 MAX_PING_INTERVAL = 1800
 MAX_RESTART_ATTEMPTS = 3
 SYNC_INTERVAL = 30 * 24 * 3600  # 30 дней
 CLEAN_VIOLATIONS_INTERVAL = 50 * 24 * 3600
-REQUEST_TIMEOUT = 60  # Уменьшено с 120 до 60 секунд
+REQUEST_TIMEOUT = 120
 ENABLE_CPU_TRACKING = os.getenv("ENABLE_CPU_TRACKING", "False").lower() == "true"
 CPU_THRESHOLD_DEFAULT = 80.0
 RAM_THRESHOLD_DEFAULT = 90.0
@@ -150,9 +150,8 @@ BAD_WORDS_PATTERN = re.compile(
     re.IGNORECASE | re.UNICODE
 )
 
-# Очередь задач с увеличенным размером
-task_queue = asyncio.Queue(maxsize=200)  # Увеличено с 50 до 200
-db_lock = asyncio.Lock()  # Добавлена блокировка для базы данных
+# Очередь задач
+task_queue = asyncio.Queue(maxsize=50)
 
 # База данных и кэш
 async def init_db() -> None:
@@ -164,51 +163,47 @@ async def init_db() -> None:
         await conn.commit()
 
 async def load_violations_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
-    async with db_lock:
-        async with aiosqlite.connect("violations.db", timeout=DB_TIMEOUT) as conn:
-            async with conn.execute("SELECT user_id, count, last_violation FROM violations") as cursor:
-                async for user_id, count, last_violation in cursor:
-                    context.bot_data.setdefault('violations_cache', {})[user_id] = {
-                        "count": count,
-                        "last_violation": datetime.fromisoformat(last_violation) if last_violation else None
-                    }
+    async with aiosqlite.connect("violations.db", timeout=DB_TIMEOUT) as conn:
+        async with conn.execute("SELECT user_id, count, last_violation FROM violations") as cursor:
+            async for user_id, count, last_violation in cursor:
+                context.bot_data.setdefault('violations_cache', {})[user_id] = {
+                    "count": count,
+                    "last_violation": datetime.fromisoformat(last_violation) if last_violation else None
+                }
 
 async def sync_violations_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        async with db_lock:
-            async with aiosqlite.connect("violations.db", timeout=DB_TIMEOUT) as conn:
-                async with conn.cursor() as cursor:
-                    for user_id, data in context.bot_data.get('violations_cache', {}).items():
-                        await cursor.execute(
-                            "INSERT OR REPLACE INTO violations (user_id, count, last_violation) VALUES (?, ?, ?)",
-                            (user_id, data["count"], data["last_violation"].isoformat() if data["last_violation"] else None)
-                        )
-                    await conn.commit()
+        async with aiosqlite.connect("violations.db", timeout=DB_TIMEOUT) as conn:
+            async with conn.cursor() as cursor:
+                for user_id, data in context.bot_data.get('violations_cache', {}).items():
+                    await cursor.execute(
+                        "INSERT OR REPLACE INTO violations (user_id, count, last_violation) VALUES (?, ?, ?)",
+                        (user_id, data["count"], data["last_violation"].isoformat() if data["last_violation"] else None)
+                    )
+                await conn.commit()
         logger.debug("Кэш нарушений синхронизирован с базой данных")
     except Exception as e:
         logger.error(f"Ошибка синхронизации кэша: {e}")
 
 async def clean_violations_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = get_current_time()
-    async with db_lock:
-        cache = context.bot_data.get('violations_cache', {})
-        removed = 0
-        for user_id in list(cache.keys()):
-            if now - cache[user_id]["last_violation"] > timedelta(hours=VIOLATION_TIMEOUT_HOURS):
-                del cache[user_id]
-                removed += 1
-        if removed > 0:
-            logger.info(f"Кэш нарушений очищен, удалено {removed} устаревших записей")
+    cache = context.bot_data.get('violations_cache', {})
+    removed = 0
+    for user_id in list(cache.keys()):
+        if now - cache[user_id]["last_violation"] > timedelta(hours=VIOLATION_TIMEOUT_HOURS):
+            del cache[user_id]
+            removed += 1
+    if removed > 0:
+        logger.info(f"Кэш нарушений очищен, удалено {removed} устаревших записей")
 
 async def get_violations(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> Dict[str, any]:
     return context.bot_data.get('violations_cache', {}).get(user_id, {"count": 0, "last_violation": None})
 
 async def update_violations(user_id: int, count: int, last_violation: datetime, context: ContextTypes.DEFAULT_TYPE) -> None:
-    async with db_lock:
-        context.bot_data.setdefault('violations_cache', {})[user_id] = {
-            "count": count,
-            "last_violation": last_violation
-        }
+    context.bot_data.setdefault('violations_cache', {})[user_id] = {
+        "count": count,
+        "last_violation": last_violation
+    }
 
 # Вспомогательные функции
 def get_current_time() -> datetime:
@@ -239,33 +234,18 @@ def rate_limit(command_name: str = "default"):
 
 async def notify_admins(context: ContextTypes.DEFAULT_TYPE, message: str) -> None:
     for admin_id in ADMIN_IDS:
-        await safe_put(task_queue, lambda: context.bot.send_message(chat_id=admin_id, text=message, parse_mode="HTML"))
+        await task_queue.put(
+            lambda: context.bot.send_message(chat_id=admin_id, text=message, parse_mode="HTML")
+        )
 
 def create_subscribe_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("👉 ПОДПИСАТЬСЯ НА КАНАЛ 👈", url=CHANNEL_URL)]])
-
-# Новая функция для безопасной постановки задач в очередь
-async def safe_put(queue, task):
-    try:
-        await queue.put(task)
-    except asyncio.QueueFull:
-        logger.warning("Очередь задач переполнена!")
-        await notify_admins(context, "⚠️ Очередь задач переполнена!")
 
 # Кэширование прав бота
 async def get_bot_rights(context: ContextTypes.DEFAULT_TYPE) -> dict:
     if 'bot_rights' not in context.bot_data:
         context.bot_data['bot_rights'] = await context.bot.get_chat_member(chat_id=GROUP_ID, user_id=context.bot.id)
     return context.bot_data['bot_rights']
-
-# Проверка доступа к группе
-async def check_group_access(application: Application) -> None:
-    try:
-        await application.bot.get_chat(GROUP_ID)
-        logger.info(f"Доступ к группе {GROUP_ID} подтверждён")
-    except BadRequest as e:
-        logger.critical(f"Нет доступа к группе {GROUP_ID}: {e}")
-        sys.exit(1)
 
 # Мониторинг ресурсов
 def check_resources(context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -350,14 +330,26 @@ def check_duplicate_process() -> bool:
     return False
 
 # Перезапуск и пинг
+async def activate_ping(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.bot_data.get('ping_enabled', False):
+        logger.info("Активирую экстренный механизм пинга для перезапуска")
+        context.bot_data['ping_enabled'] = True
+        context.job_queue.run_repeating(
+            ping_uptime,
+            interval=lambda ctx: max(MIN_PING_INTERVAL, min(ctx.bot_data.get('ping_interval', PING_INTERVAL), MAX_PING_INTERVAL)),
+            first=10,
+            name="ping_uptime"
+        )
+
 async def restart_self(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> None:
     restart_attempts = context.bot_data.get('restart_attempts', 0) if context else 0
     restart_attempts += 1
 
     if restart_attempts > MAX_RESTART_ATTEMPTS:
-        logger.critical(f"Превышено максимальное количество перезапусков ({MAX_RESTART_ATTEMPTS}).")
+        logger.critical(f"Превышено максимальное количество перезапусков ({MAX_RESTART_ATTEMPTS}). Активирую пинг.")
         if context:
-            await notify_admins(context, f"🚨 Превышено максимальное количество перезапусков ({MAX_RESTART_ATTEMPTS}).")
+            await notify_admins(context, f"🚨 Превышено максимальное количество перезапусков ({MAX_RESTART_ATTEMPTS}). Активирован пинг.")
+            await activate_ping(context)
         return
 
     if context:
@@ -370,14 +362,8 @@ async def restart_self(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> N
     try:
         logger.info(f"Перезапуск бота (попытка {restart_attempts}/{MAX_RESTART_ATTEMPTS})...")
         cmd = [sys.executable, os.path.abspath(__file__)]
-        process = subprocess.Popen(cmd, env=os.environ.copy(), shell=(platform.system() == "Windows"))
-        await asyncio.sleep(5)  # Увеличено с 2 до 5 секунд
-        if process.poll() is None:
-            logger.info("Новый процесс запущен успешно")
-        else:
-            logger.error("Ошибка запуска нового процесса")
-            if context:
-                await notify_admins(context, "🚨 Ошибка перезапуска бота!")
+        subprocess.Popen(cmd, env=os.environ.copy(), shell=(platform.system() == "Windows"))
+        await asyncio.sleep(2)
         sys.exit(0)
     except Exception as e:
         logger.error(f"Ошибка при перезапуске: {e}")
@@ -385,28 +371,30 @@ async def restart_self(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> N
         await restart_self(context)
 
 @retry(
-    stop=stop_after_attempt(5),  # Уменьшено до 5 попыток
-    wait=wait_exponential(multiplier=1, min=2, max=30),
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=1, min=2, max=60),
     retry=retry_if_exception_type(Exception),
     before_sleep=lambda retry_state: logger.warning(f"Повтор пинга, попытка {retry_state.attempt_number}")
 )
 @track_cpu_time
 async def ping_uptime(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not check_resources(context):
-        logger.info("Высокая нагрузка, пропускаю пинг")
+    if not context.bot_data.get('ping_enabled', False) or not check_resources(context):
+        logger.info("Пинг отключен или высокая нагрузка, пропускаю")
         return
-    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=15.0)) as client:
         try:
-            headers = {"User-Agent": "PalatkiDVBot/1.0"}  # Добавлен User-Agent
-            response = await client.get(PING_URL, headers=headers)
+            response = await client.get(PING_URL)
             response.raise_for_status()
             logger.info(f"Пинг успешен: {response.status_code}")
+            current_interval = context.bot_data.get('ping_interval', PING_INTERVAL)
+            context.bot_data['ping_interval'] = min(current_interval + 60, MAX_PING_INTERVAL)
         except httpx.HTTPStatusError as e:
             logger.warning(f"Ошибка пинга: {e.response.status_code}")
             raise
         except Exception as e:
             logger.error(f"Не удалось выполнить пинг: {e}")
-            await notify_admins(context, f"🚨 Ошибка пинга: {e}")
+            current_interval = context.bot_data.get('ping_interval', PING_INTERVAL)
+            context.bot_data['ping_interval'] = max(current_interval - 60, MIN_PING_INTERVAL)
             await restart_self(context)
 
 # Обработчики
@@ -443,6 +431,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.info(f"Приветствие для {name} ({member.id}) в группе")
         except (NetworkError, TimedOut):
             logger.warning("Сетевая ошибка при отправке приветствия")
+            await activate_ping(context)
             raise
         except BadRequest as e:
             logger.error(f"Неверный запрос при отправке приветствия: {e}")
@@ -457,6 +446,7 @@ async def welcome_read_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.delete()
     except (NetworkError, TimedOut):
         logger.warning("Сетевая ошибка при обработке кнопки")
+        await activate_ping(context)
     except BadRequest as e:
         logger.error(f"Неверный запрос при обработке кнопки: {e}")
 
@@ -480,8 +470,12 @@ async def night_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "🙏 Спасибо за ваше терпение и понимание! 💫"
     )
     keyboard = create_subscribe_keyboard()
-    await safe_put(task_queue, lambda: update.message.reply_text(response, parse_mode="HTML", reply_markup=keyboard))
-    await safe_put(task_queue, lambda: context.bot.send_message(chat_id=OWNER_ID, text=f"🔔 Ночное сообщение от {user_name} (ID: {user_id}): {text}", parse_mode="HTML"))
+    await task_queue.put(
+        lambda: update.message.reply_text(response, parse_mode="HTML", reply_markup=keyboard)
+    )
+    await task_queue.put(
+        lambda: context.bot.send_message(chat_id=OWNER_ID, text=f"🔔 Ночное сообщение от {user_name} (ID: {user_id}): {text}", parse_mode="HTML")
+    )
 
 @track_cpu_time
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -513,22 +507,27 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 await update.message.delete()
             remaining_lives = MAX_VIOLATIONS - count
             keyboard = create_subscribe_keyboard()
-            await safe_put(task_queue, lambda: context.bot.send_message(
-                chat_id=GROUP_ID,
-                text=f"⚠️ Нарушение правил! Слово: '{word}'. Осталось предупреждений: {remaining_lives}",
-                parse_mode="HTML",
-                reply_markup=keyboard
-            ))
+            await task_queue.put(
+                lambda: context.bot.send_message(
+                    chat_id=GROUP_ID,
+                    text=f"⚠️ Нарушение правил! Слово: '{word}'. Осталось предупреждений: {remaining_lives}",
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+            )
             if count >= MAX_VIOLATIONS and bot_rights.can_restrict_members:
                 await context.bot.ban_chat_member(GROUP_ID, user_id)
-                await safe_put(task_queue, lambda: context.bot.send_message(
-                    chat_id=GROUP_ID,
-                    text="🚫 Пользователь заблокирован.",
-                    reply_markup=keyboard
-                ))
+                await task_queue.put(
+                    lambda: context.bot.send_message(
+                        chat_id=GROUP_ID,
+                        text="🚫 Пользователь заблокирован.",
+                        reply_markup=keyboard
+                    )
+                )
             break
         except (NetworkError, TimedOut):
             logger.warning("Сетевая ошибка при проверке сообщения")
+            await activate_ping(context)
         except BadRequest as e:
             logger.error(f"Неверный запрос при проверке сообщения: {e}")
 
@@ -578,7 +577,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ram_usage = psutil.virtual_memory().percent
     messages_processed = context.bot_data.get('messages_processed', 0)
     restarts = context.bot_data.get('restart_attempts', 0)
-    queue_size = task_queue.qsize()  # Добавлено отображение размера очереди задач
+    ping_status = "Активен" if context.bot_data.get('ping_enabled', False) else "Не активен"
     cpu_threshold = context.bot_data.get('cpu_threshold', CPU_THRESHOLD_DEFAULT)
     ram_threshold = context.bot_data.get('ram_threshold', RAM_THRESHOLD_DEFAULT)
     status_text = (
@@ -587,9 +586,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"📩 Обработано сообщений: {messages_processed}\n"
         f"💻 CPU: {cpu_usage:.1f}% (порог: {cpu_threshold:.1f}%)\n"
         f"🧠 RAM: {ram_usage:.1f}% (порог: {ram_threshold:.1f}%)\n"
-        f"📋 Задач в очереди: {queue_size}\n"
         f"🔄 Перезапусков: {restarts}\n"
-        f"📡 Пинг: Активен"
+        f"📡 Пинг: {ping_status}"
     )
     await update.message.reply_text(status_text, parse_mode="HTML")
 
@@ -646,6 +644,7 @@ async def health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Бот жив")
     except (NetworkError, TimedOut):
         logger.error("Сетевая ошибка при проверке здоровья")
+        await activate_ping(context)
         await restart_self(context)
         raise
     except BadRequest as e:
@@ -657,7 +656,8 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
     error = context.error
     logger.error(f"Ошибка: {error}", exc_info=error)
     if isinstance(error, (NetworkError, TimedOut)):
-        logger.warning("Сетевая ошибка, перезапуск...")
+        logger.warning("Сетевая ошибка, активирую пинг и перезапуск...")
+        await activate_ping(context)
         await restart_self(context)
     elif isinstance(error, BadRequest):
         logger.critical(f"Критическая ошибка Telegram API: {error}")
@@ -669,11 +669,12 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
 # Основной цикл
 async def run_bot(application: Application) -> None:
     await init_db()
-    await check_group_access(application)  # Добавлена проверка доступа к группе
     application.bot_data['start_time'] = time.time()
     application.bot_data['restart_attempts'] = 0
     application.bot_data['messages_processed'] = 0
     application.bot_data['violations_cache'] = {}
+    application.bot_data['ping_interval'] = PING_INTERVAL
+    application.bot_data['ping_enabled'] = True  # Пинг активен сразу для теста
     application.bot_data['cpu_threshold'] = CPU_THRESHOLD_DEFAULT
     application.bot_data['ram_threshold'] = RAM_THRESHOLD_DEFAULT
     await load_violations_cache(application)
@@ -693,11 +694,10 @@ async def run_bot(application: Application) -> None:
         fallbacks=[CommandHandler("cancel", cancel)]
     ))
     application.add_error_handler(error_handler)
-    application.job_queue.run_repeating(health_check, interval=3600, name="health_check")  # Уменьшено с 21600 до 3600
+    application.job_queue.run_repeating(health_check, interval=21600, name="health_check")
     application.job_queue.run_repeating(sync_violations_cache, interval=SYNC_INTERVAL, name="sync_violations")
     application.job_queue.run_repeating(clean_violations_cache, interval=CLEAN_VIOLATIONS_INTERVAL, name="clean_violations")
     application.job_queue.run_repeating(adjust_resource_thresholds, interval=RESOURCE_CHECK_INTERVAL, name="adjust_thresholds")
-    application.job_queue.run_repeating(ping_uptime, interval=PING_INTERVAL, first=10, name="ping_uptime")  # Пинг всегда активен
 
 async def post_init(application: Application) -> None:
     application.create_task(task_worker(application), name="task_worker")
@@ -766,8 +766,4 @@ async def main() -> None:
             await asyncio.sleep(RESTART_DELAY)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logger.critical(f"Критическая ошибка при запуске: {e}")
-        sys.exit(1)
+    asyncio.run(main())
