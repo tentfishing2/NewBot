@@ -46,6 +46,7 @@ CPU_LIMIT_SECONDS = 90
 MIN_MESSAGE_LENGTH = 10
 PING_INTERVAL = 900  # 15 минут
 PING_URL = "https://uptime.betterstack.com/api/v2/heartbeat/X7K9P2M5Q8N3B6J1"
+MAX_RESTART_ATTEMPTS = 3  # Максимальное количество автоматических перезапусков
 
 # Лимиты для rate limiting (в секундах)
 RATE_LIMITS = {
@@ -217,16 +218,25 @@ def is_bot_running():
         logger.error(f"Ошибка проверки процессов: {e}")
         return False
 
-async def restart_self():
+async def restart_self(context: ContextTypes.DEFAULT_TYPE = None):
+    restart_attempts = context.bot_data.get('restart_attempts', 0) if context else 0
+    restart_attempts += 1
+    if restart_attempts > MAX_RESTART_ATTEMPTS:
+        logger.critical(f"Превышено максимальное количество перезапусков ({MAX_RESTART_ATTEMPTS}). Требуется ручной перезапуск.")
+        if context:
+            await notify_admins(context, f"🚨 Бот остановлен: превышено максимальное количество перезапусков ({MAX_RESTART_ATTEMPTS}). Перезапустите вручную.")
+        sys.exit(1)  # Останавливаем бота полностью
+    if context:
+        context.bot_data['restart_attempts'] = restart_attempts
     try:
-        logger.info("Инициирую перезапуск бота...")
+        logger.info(f"Инициирую перезапуск бота (попытка {restart_attempts}/{MAX_RESTART_ATTEMPTS})...")
         subprocess.Popen(['python3', os.path.abspath(__file__)], env=os.environ.copy())
         await asyncio.sleep(2)
         sys.exit(0)
     except Exception as e:
         logger.error(f"Ошибка при перезапуске: {e}")
         await asyncio.sleep(RESTART_DELAY)
-        await restart_self()
+        await restart_self(context)
 
 @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=2, max=60), retry=retry_if_exception(Exception))
 @track_cpu_time
@@ -241,7 +251,7 @@ async def ping_uptime(context: ContextTypes.DEFAULT_TYPE):
                 raise Exception("Неудачный пинг, перезапуск...")
         except Exception as e:
             logger.error(f"Не удалось выполнить пинг: {e}")
-            await restart_self()
+            await restart_self(context)
 
 # Обработчики
 @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=2, max=60), retry=retry_if_exception(lambda e: isinstance(e, (NetworkError, TimedOut, BadRequest))))
@@ -460,14 +470,14 @@ async def health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Бот жив")
     except Exception as e:
         logger.error(f"Ошибка проверки здоровья: {e}")
-        await restart_self()
+        await restart_self(context)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Ошибка: {context.error}", exc_info=context.error)
     await notify_admins(context, f"🚨 Ошибка: {context.error}")
     if isinstance(context.error, (NetworkError, TimedOut, BadRequest, TelegramError)):
         logger.warning("Сетевая ошибка или ошибка Telegram, инициирую перезапуск...")
-        await restart_self()
+        await restart_self(context)
 
 # Основной цикл бота
 async def run_bot():
@@ -475,6 +485,9 @@ async def run_bot():
     request = HTTPXRequest(connect_timeout=120, read_timeout=120, pool_timeout=120, write_timeout=120)
     app = ApplicationBuilder().token(BOT_TOKEN).request(request).concurrent_updates(True).build()
     await init_db()
+
+    # Сбрасываем счётчик перезапусков при успешном старте
+    app.bot_data['restart_attempts'] = 0
 
     # Добавление обработчиков
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
@@ -503,10 +516,10 @@ async def run_bot():
             bootstrap_retries=5,
             error_callback=lambda e: logger.error(f"Ошибка polling: {e}")
         )
-        logger.info("🤖 Бот запущен в режиме polling!")
+        logger.info("🤖 Бот успешно запущен!")
     except Exception as e:
         logger.critical(f"Ошибка запуска бота: {e}")
-        await restart_self()
+        await restart_self(app)
 
     # Ожидание завершения
     shutdown_event = asyncio.Event()
@@ -537,7 +550,7 @@ async def main():
         except Exception as e:
             logger.critical(f"Критическая ошибка: {e}. Перезапуск через {RESTART_DELAY} секунд...")
             await asyncio.sleep(RESTART_DELAY)
-            await restart_self()
+            await restart_self()  # Здесь тоже применяется ограничение
 
 if __name__ == "__main__":
     asyncio.run(main())
