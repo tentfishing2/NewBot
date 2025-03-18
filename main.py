@@ -3,6 +3,7 @@ import sys
 import asyncio
 import signal
 import time
+import platform  # Добавлен импорт
 from datetime import datetime, timedelta
 from typing import Set, Dict, Optional
 import aiosqlite
