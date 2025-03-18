@@ -46,7 +46,7 @@ CONTROL_RESTART_INTERVAL = 1200  # 20 минут
 HEARTBEAT_INTERVAL = 300  # 5 минут
 MAX_VIOLATIONS = 3
 MIN_MESSAGE_LENGTH = 10
-MAX_RESTART_ATTEMPTS = 5  # Увеличено для надежности
+MAX_RESTART_ATTEMPTS = 5
 SYNC_INTERVAL = 30 * 24 * 3600  # 30 дней
 CLEAN_VIOLATIONS_INTERVAL = 50 * 24 * 3600
 REQUEST_TIMEOUT = 120
@@ -132,7 +132,7 @@ HELP_TEXT = (
     "• /start — активация бота;\n"
     "• /rules — правила сообщества;\n"
     "• /help — список команд;\n"
-    "• /stats — статистика (для админов);\n"
+    "• /stats — статистика (для админов): подписавшиеся за день/месяц, нарушения, заблокированные;\n"
     "• /status — состояние бота (для админов);\n"
     "• /restart — перезапуск бота (для админов)."
 )
@@ -158,8 +158,11 @@ async def init_db() -> None:
             '''CREATE TABLE IF NOT EXISTS violations 
                (user_id INTEGER PRIMARY KEY, count INTEGER, last_violation TEXT)'''
         )
+        await conn.execute(
+            '''CREATE TABLE IF NOT EXISTS subscriptions 
+               (user_id INTEGER PRIMARY KEY, subscription_time TEXT)'''
+        )
         await conn.commit()
-    logger.info("База данных инициализирована")
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def load_violations_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -170,7 +173,11 @@ async def load_violations_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
                     "count": count,
                     "last_violation": datetime.fromisoformat(last_violation) if last_violation else None
                 }
-    logger.info("Кэш нарушений загружен")
+        async with conn.execute("SELECT user_id, subscription_time FROM subscriptions") as cursor:
+            async for user_id, subscription_time in cursor:
+                context.bot_data.setdefault('subscriptions_cache', {})[user_id] = {
+                    "subscription_time": datetime.fromisoformat(subscription_time)
+                }
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def sync_violations_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -182,8 +189,12 @@ async def sync_violations_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
                         "INSERT OR REPLACE INTO violations (user_id, count, last_violation) VALUES (?, ?, ?)",
                         (user_id, data["count"], data["last_violation"].isoformat() if data["last_violation"] else None)
                     )
+                for user_id, data in context.bot_data.get('subscriptions_cache', {}).items():
+                    await cursor.execute(
+                        "INSERT OR REPLACE INTO subscriptions (user_id, subscription_time) VALUES (?, ?)",
+                        (user_id, data["subscription_time"].isoformat())
+                    )
                 await conn.commit()
-        logger.debug("Кэш нарушений синхронизирован")
     except Exception as e:
         logger.error(f"Ошибка синхронизации кэша: {e}")
 
@@ -205,6 +216,12 @@ async def update_violations(user_id: int, count: int, last_violation: datetime, 
     context.bot_data.setdefault('violations_cache', {})[user_id] = {
         "count": count,
         "last_violation": last_violation
+    }
+
+async def update_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = get_current_time()
+    context.bot_data.setdefault('subscriptions_cache', {})[user_id] = {
+        "subscription_time": now
     }
 
 # Вспомогательные функции
@@ -238,7 +255,6 @@ def rate_limit(command_name: str = "default"):
 async def notify_admins(context: ContextTypes.DEFAULT_TYPE, message: str) -> None:
     for admin_id in ADMIN_IDS:
         await context.bot.send_message(chat_id=admin_id, text=message, parse_mode="HTML")
-    logger.info(f"Уведомление админам: {message}")
 
 def create_subscribe_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("👉 ПОДПИСАТЬСЯ НА КАНАЛ 👈", url=CHANNEL_URL)]])
@@ -255,11 +271,8 @@ def check_resources(context: ContextTypes.DEFAULT_TYPE) -> bool:
         ram_usage = psutil.virtual_memory().percent
         cpu_threshold = context.bot_data.get('cpu_threshold', CPU_THRESHOLD_DEFAULT)
         ram_threshold = context.bot_data.get('ram_threshold', RAM_THRESHOLD_DEFAULT)
-        if cpu_usage >= cpu_threshold or ram_usage >= ram_threshold:
-            logger.warning(f"Высокая нагрузка: CPU={cpu_usage}%, RAM={ram_usage}%")
         return cpu_usage < cpu_threshold and ram_usage < ram_threshold
-    except Exception as e:
-        logger.error(f"Ошибка проверки ресурсов: {e}")
+    except Exception:
         return True
 
 async def adjust_resource_thresholds(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -283,13 +296,10 @@ async def adjust_resource_thresholds(context: ContextTypes.DEFAULT_TYPE) -> None
         else:
             new_ram_threshold = current_ram_threshold
 
-        if new_cpu_threshold != current_cpu_threshold or new_ram_threshold != current_ram_threshold:
-            context.bot_data['cpu_threshold'] = new_cpu_threshold
-            context.bot_data['ram_threshold'] = new_ram_threshold
-            logger.debug(f"Пороги ресурсов обновлены: CPU={new_cpu_threshold}%, RAM={new_ram_threshold}%")
-            await notify_admins(context, f"🔧 Пороги ресурсов обновлены: CPU={new_cpu_threshold}%, RAM={new_ram_threshold}%")
-    except Exception as e:
-        logger.error(f"Ошибка регулировки порогов: {e}")
+        context.bot_data['cpu_threshold'] = new_cpu_threshold
+        context.bot_data['ram_threshold'] = new_ram_threshold
+    except Exception:
+        pass
 
 def track_cpu_time(func):
     @wraps(func)
@@ -313,7 +323,7 @@ async def task_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
             await task()
             task_queue.task_done()
         except asyncio.TimeoutError:
-            logger.debug("Очередь задач пуста")
+            pass
         except Exception as e:
             logger.error(f"Ошибка в задаче: {e}")
             task_queue.task_done()
@@ -325,7 +335,6 @@ def check_duplicate_process() -> bool:
         try:
             cmdline = proc.info['cmdline']
             if proc.pid != current_pid and cmdline and script_name in ' '.join(cmdline):
-                logger.warning(f"Обнаружен дублирующий процесс PID={proc.pid}")
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError):
             continue
@@ -340,14 +349,13 @@ async def restart_self(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> N
         logger.critical(f"Превышено максимальное количество перезапусков ({MAX_RESTART_ATTEMPTS})")
         if context:
             await notify_admins(context, f"🚨 Превышено максимальное количество перезапусков ({MAX_RESTART_ATTEMPTS})")
-        await asyncio.sleep(CONTROL_RESTART_INTERVAL)  # Контрольный перезапуск через 20 минут
-        restart_attempts = 0  # Сброс попыток для нового цикла
+        await asyncio.sleep(CONTROL_RESTART_INTERVAL)
+        restart_attempts = 0
 
     if context:
         context.bot_data['restart_attempts'] = restart_attempts
 
     if check_duplicate_process():
-        logger.warning("Обнаружен дублирующий процесс, завершаю текущий")
         sys.exit(0)
 
     try:
@@ -361,12 +369,11 @@ async def restart_self(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> N
         await asyncio.sleep(RESTART_DELAY * (2 ** min(restart_attempts, 5)))
         await restart_self(context)
 
-# Heartbeat для предотвращения усыпления
+# Heartbeat
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def heartbeat(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await context.bot.get_me()
-        logger.debug("Heartbeat: бот активен")
     except Exception as e:
         logger.error(f"Ошибка heartbeat: {e}")
         await restart_self(context)
@@ -398,13 +405,14 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             WELCOME_MESSAGE_TIMEOUT,
             name=f"delete_welcome_{group_msg.message_id}"
         )
-        logger.info(f"Приветствие для {name} ({member.id})")
 
 @track_cpu_time
 async def welcome_read_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     await query.message.delete()
+    user_id = query.from_user.id
+    await update_subscription(user_id, context)
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
 @track_cpu_time
@@ -462,6 +470,7 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         if count >= MAX_VIOLATIONS and bot_rights.can_restrict_members:
             await context.bot.ban_chat_member(GROUP_ID, user_id)
+            context.bot_data.setdefault('banned_users', set()).add(user_id)
             await context.bot.send_message(
                 chat_id=GROUP_ID,
                 text="🚫 Пользователь заблокирован.",
@@ -487,11 +496,24 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("🚫 Команда только для админов!")
         return
+    now = get_current_time()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    subscriptions = context.bot_data.get('subscriptions_cache', {})
+    subs_today = sum(1 for data in subscriptions.values() if data["subscription_time"] >= day_start)
+    subs_month = sum(1 for data in subscriptions.values() if data["subscription_time"] >= month_start)
     violations = context.bot_data.get('violations_cache', {})
-    if not violations:
-        await update.message.reply_text("📊 Нарушений нет.")
-        return
-    message = "📊 <b>Статистика:</b>\n" + "\n".join(f"ID {user_id}: {data['count']} нарушений" for user_id, data in violations.items())
+    total_violations = sum(data["count"] for data in violations.values())
+    banned_users = len(context.bot_data.get('banned_users', set()))
+
+    message = (
+        "📊 <b>Статистика:</b>\n"
+        f"👥 Подписавшихся сегодня: {subs_today}\n"
+        f"👥 Подписавшихся за месяц: {subs_month}\n"
+        f"⚠️ Всего нарушений: {total_violations}\n"
+        f"🚫 Заблокированных: {banned_users}"
+    )
     await update.message.reply_text(message, parse_mode="HTML")
 
 @rate_limit("restart")
@@ -569,10 +591,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 @track_cpu_time
 async def health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not check_resources(context):
-        logger.warning("Высокая нагрузка, пропускаю проверку")
         return
     await context.bot.get_me()
-    logger.info("Бот жив и работает")
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE) -> None:
     error = context.error
@@ -586,6 +606,7 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
         sys.exit(1)
     else:
         logger.error(f"Неизвестная ошибка, перезапуск...")
+        await notify_admins(context, f"🚨 Неизвестная ошибка: {error}. Перезапуск бота.")
         await restart_self(context)
 
 # Основной цикл
@@ -595,6 +616,8 @@ async def run_bot(application: Application) -> None:
     application.bot_data['restart_attempts'] = 0
     application.bot_data['messages_processed'] = 0
     application.bot_data['violations_cache'] = {}
+    application.bot_data['subscriptions_cache'] = {}
+    application.bot_data['banned_users'] = set()
     application.bot_data['cpu_threshold'] = CPU_THRESHOLD_DEFAULT
     application.bot_data['ram_threshold'] = RAM_THRESHOLD_DEFAULT
     await load_violations_cache(application)
@@ -655,7 +678,6 @@ async def main() -> None:
                 error_callback=lambda e: logger.error(f"Ошибка polling: {e}")
             )
             logger.info("🤖 Бот успешно запущен!")
-            await notify_admins(app, "🤖 Бот успешно запущен!")
 
             shutdown_event = asyncio.Event()
 
@@ -677,6 +699,7 @@ async def main() -> None:
             break
         except Exception as e:
             logger.error(f"Критическая ошибка в основном цикле: {e}")
+            await notify_admins(app, f"🚨 Критическая ошибка в основном цикле: {e}. Бот перезапускается.")
             await asyncio.sleep(RESTART_DELAY)
             await restart_self(app)
 
