@@ -34,6 +34,7 @@ load_dotenv()
 # Настройка логирования
 logger.remove()
 logger.add("bot.log", rotation="1 MB", level="INFO", encoding="utf-8", backtrace=True, diagnose=True)
+logger.add(sys.stdout, level="INFO", format="{time} | {level} | {message}")  # Вывод в консоль
 
 # Константы
 MAX_ATTEMPTS = 3
@@ -45,6 +46,15 @@ CPU_LIMIT_SECONDS = 90
 MIN_MESSAGE_LENGTH = 10
 PING_INTERVAL = 900  # 15 минут
 PING_URL = "https://uptime.betterstack.com/api/v2/heartbeat/X7K9P2M5Q8N3B6J1"
+
+# Лимиты для rate limiting (в секундах)
+RATE_LIMITS = {
+    "default": 5,    # Лимит по умолчанию: 5 секунд между командами
+    "start": 10,     # Лимит для /start: 10 секунд
+    "rules": 5,      # Лимит для /rules: 5 секунд
+    "help": 5,       # Лимит для /help: 5 секунд
+    "stats": 30      # Лимит для /stats: 30 секунд (для админов)
+}
 
 # Переменные окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
