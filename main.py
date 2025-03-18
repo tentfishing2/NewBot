@@ -21,7 +21,7 @@ from telegram.ext import (
 from telegram.error import TelegramError, NetworkError, TimedOut, BadRequest
 from telegram.request import HTTPXRequest
 import pytz
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 from functools import wraps
 from loguru import logger
 import subprocess
@@ -31,8 +31,8 @@ import httpx
 # Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования (только один файл логов)
-logger.remove()  # Удаляем стандартный обработчик
+# Настройка логирования
+logger.remove()
 logger.add("bot.log", rotation="1 MB", level="INFO", encoding="utf-8", backtrace=True, diagnose=True)
 
 # Константы
@@ -43,8 +43,8 @@ RESTART_DELAY = 60
 MAX_VIOLATIONS = 3
 CPU_LIMIT_SECONDS = 90
 MIN_MESSAGE_LENGTH = 10
-PING_INTERVAL = 900  # Проверка пинга каждые 15 минут
-PING_URL = "https://uptime.betterstack.com/api/v2/heartbeat/X7K9P2M5Q8N3B6J1"  # Готовая ссылка для Better Uptime
+PING_INTERVAL = 900  # 15 минут
+PING_URL = "https://uptime.betterstack.com/api/v2/heartbeat/X7K9P2M5Q8N3B6J1"
 
 # Переменные окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -63,7 +63,7 @@ if not all([BOT_TOKEN, SECRET_CODE, CHANNEL_URL]):
     logger.critical("Отсутствуют обязательные переменные окружения!")
     raise SystemExit(1)
 
-# Сообщения (исправлены синтаксические ошибки)
+# Сообщения
 WELCOME_TEXT = (
     "🌄✨ **Привет, {name}!** 🌟\n"
     "🏕️🌲 Добро пожаловать в **«Палатки-ДВ»** — место, где начинаются твои лучшие приключения!\n\n"
@@ -218,7 +218,8 @@ async def restart_self():
         await asyncio.sleep(RESTART_DELAY)
         await restart_self()
 
-@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=2, max=60), retry_if_exception_type(Exception))
+@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=2, max=60), retry=retry_if_exception(Exception))
+@track_cpu_time
 async def ping_uptime(context: ContextTypes.DEFAULT_TYPE):
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=15.0)) as client:
         try:
@@ -233,7 +234,7 @@ async def ping_uptime(context: ContextTypes.DEFAULT_TYPE):
             await restart_self()
 
 # Обработчики
-@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=2, max=60), retry_if_exception_type((NetworkError, TimedOut, BadRequest)))
+@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=2, max=60), retry=retry_if_exception(lambda e: isinstance(e, (NetworkError, TimedOut, BadRequest))))
 @track_cpu_time
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat_id != GROUP_ID or not update.message.new_chat_members:
@@ -272,7 +273,7 @@ async def welcome_read_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"Ошибка обработки кнопки: {e}")
 
-@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=2, max=60), retry_if_exception_type((NetworkError, TimedOut, BadRequest)))
+@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=2, max=60), retry=retry_if_exception(lambda e: isinstance(e, (NetworkError, TimedOut, BadRequest))))
 @track_cpu_time
 async def night_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat_id != GROUP_ID or not update.message.text:
@@ -441,7 +442,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         logger.error(f"Ошибка отмены: {e}")
         return ConversationHandler.END
 
-@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=2, max=60), retry_if_exception_type((NetworkError, TimedOut)))
+@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=2, max=60), retry=retry_if_exception(lambda e: isinstance(e, (NetworkError, TimedOut))))
+@track_cpu_time
 async def health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await context.bot.get_me()
@@ -479,7 +481,7 @@ async def run_bot():
     ))
     app.add_error_handler(error_handler)
     app.job_queue.run_repeating(health_check, interval=21600)
-    app.job_queue.run_repeating(ping_uptime, interval=PING_INTERVAL)  # Периодический пинг каждые 15 минут
+    app.job_queue.run_repeating(ping_uptime, interval=PING_INTERVAL)
 
     try:
         await app.initialize()
