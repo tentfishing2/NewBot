@@ -59,6 +59,7 @@ RATE_LIMITS = {
     "stats": 30,
     "restart": 60,
     "status": 30,
+    "contacts": 5,
 }
 
 # Переменные окружения
@@ -122,6 +123,7 @@ HELP_TEXT = (
     "🌟 <b>Команды для пользователей:</b>\n\n"
     "• <b>/rules</b> — правила сообщества\n\n"
     "• <b>/help</b> — список команд\n\n"
+    "• <b>/contacts</b> — контакты для связи\n\n"
     "\n"
     "🌟 <b>Команды для администраторов:</b>\n\n"
     "• <b>/start</b> — активация бота\n\n"
@@ -129,6 +131,15 @@ HELP_TEXT = (
     "• <b>/status</b> — состояние бота\n\n"
     "\n"
     "• <b>/restart</b> — перезапуск бота\n"
+)
+
+CONTACTS_TEXT = (
+    "🌟 <b>Контакты «Палатки-ДВ»:</b>\n\n"
+    "📞 <b>Телефон:</b> 8-924-920-33-56\n"
+    "💬 <b>Telegram:</b> @palatki_lodki_khv\n"
+    "📱 <b>WhatsApp:</b> +79249203356\n"
+    "🌐 <b>Канал:</b> {CHANNEL_URL}\n\n"
+    "Обращайтесь за консультацией или заказом!"
 )
 
 BAD_WORDS_PATTERN = re.compile(
@@ -185,7 +196,7 @@ async def sync_violations_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
                 for user_id, data in context.bot_data.get('subscriptions_cache', {}).items():
                     await cursor.execute(
-                        "INSERT OR REPLACE INTO subscriptions (user_id, subscription_time) VALUES (?, ?)",
+                        "INSERT OR REPLACE INTO subscriptions (user_id, subscription_time) VALUES (?, ?, ?)",
                         (user_id, data["subscription_time"].isoformat())
                     )
                 await conn.commit()
@@ -434,6 +445,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     keyboard = create_subscribe_keyboard()
     await update.message.reply_text(HELP_TEXT, parse_mode="HTML", reply_markup=keyboard)
 
+@rate_limit("contacts")
+async def contacts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = create_subscribe_keyboard()
+    await update.message.reply_text(
+        CONTACTS_TEXT.format(CHANNEL_URL=CHANNEL_URL),
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
 @rate_limit("stats")
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
@@ -554,6 +574,7 @@ async def run_bot(application: Application) -> None:
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     application.add_handler(CommandHandler("rules", show_rules))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("contacts", contacts_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(CommandHandler("status", status_command))
